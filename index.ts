@@ -2,7 +2,7 @@ import { definePluginSettings } from "@api/Settings";
 import definePlugin from "@utils/types";
 import { OptionType, type PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { MediaEngineStore } from "@webpack/common";
+import { FluxDispatcher, MediaEngineStore } from "@webpack/common";
 
 import { matchDevice, matchWebDevice } from "./devices";
 import type { Snapshot } from "./devices";
@@ -18,13 +18,13 @@ const native = () => VencordNative.pluginHelpers.WindowsAudioSync as
 const settings = definePluginSettings({
     syncInput: {
         type: OptionType.BOOLEAN,
-        description: "Follow the Windows default microphone",
+        description: "Follow the Windows default microphone and its mute state",
         default: true,
         onChange: onDeviceChange
     },
     syncOutput: {
         type: OptionType.BOOLEAN,
-        description: "Follow the Windows default speakers or headphones",
+        description: "Follow the Windows default output and deafen when it is muted or at zero volume",
         default: true,
         onChange: onDeviceChange
     }
@@ -34,6 +34,41 @@ let controller: AbortController | undefined;
 let current: Snapshot | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
 let retries = 0;
+let mutedByPlugin = false;
+let deafenedByPlugin = false;
+let applyingSilence = false;
+
+async function syncSilence(run: AbortController, snapshot: Snapshot) {
+    if (applyingSilence) return;
+    applyingSilence = true;
+    const store = MediaEngineStore;
+    const mute = settings.store.syncInput ? snapshot.input?.silent : false;
+    const deafen = settings.store.syncOutput ? snapshot.output?.silent : false;
+    try {
+        if (deafen === false && deafenedByPlugin) {
+            if (store.isSelfDeaf()) await FluxDispatcher.dispatch({ type: "AUDIO_TOGGLE_SELF_DEAF" });
+            deafenedByPlugin = false;
+        }
+        if (run.signal.aborted) return;
+        if (!store.isSelfDeaf() && mute === true && !store.isSelfMute()) {
+            await FluxDispatcher.dispatch({ type: "AUDIO_TOGGLE_SELF_MUTE" });
+            mutedByPlugin = store.isSelfMute();
+        }
+        if (run.signal.aborted) return;
+        if (deafen === true && !store.isSelfDeaf()) {
+            await FluxDispatcher.dispatch({ type: "AUDIO_TOGGLE_SELF_DEAF" });
+            deafenedByPlugin = store.isSelfDeaf();
+        }
+        if (run.signal.aborted) return;
+        if (!store.isSelfDeaf() && mute === false && mutedByPlugin) {
+            if (store.isSelfMute()) await FluxDispatcher.dispatch({ type: "AUDIO_TOGGLE_SELF_MUTE" });
+            mutedByPlugin = false;
+        }
+    } finally {
+        applyingSilence = false;
+        if (controller && (controller !== run || current !== snapshot)) schedule(0);
+    }
+}
 
 function schedule(delay: number) {
     clearTimeout(timer);
@@ -44,11 +79,12 @@ async function apply() {
     const run = controller;
     const snapshot = current;
     if (!run || !snapshot) return;
-    if (!settings.store.syncInput && !settings.store.syncOutput) return;
     try {
         const store = MediaEngineStore;
         if (store) {
             const web = await navigator.mediaDevices?.enumerateDevices().catch(() => []) ?? [];
+            if (run.signal.aborted || current !== snapshot) return;
+            await syncSilence(run, snapshot);
             if (run.signal.aborted || current !== snapshot) return;
             let retry = false;
             if (settings.store.syncInput && snapshot.input) {
@@ -66,7 +102,7 @@ async function apply() {
             if (!retry) return;
         }
     } catch (error) {
-        console.warn("[WindowsAudioSync] Failed to select a Discord device", error);
+        console.warn("[WindowsAudioSync] Failed to synchronize Discord audio", error);
     }
     if (retries++ < 4) schedule(750);
 }
@@ -103,9 +139,17 @@ async function watch(run: AbortController) {
 
 export default definePlugin({
     name: "WindowsAudioSync",
-    description: "Selects the Windows default multimedia microphone and speakers in Discord.",
+    description: "Follows the Windows default audio devices and synchronizes microphone mute and output deafen.",
     authors: [{ name: "WindowsAudioSync contributors", id: 0n }],
     settings,
+    flux: {
+        AUDIO_TOGGLE_SELF_MUTE() {
+            if (!applyingSilence) mutedByPlugin = false;
+        },
+        AUDIO_TOGGLE_SELF_DEAF() {
+            if (!applyingSilence) deafenedByPlugin = false;
+        }
+    },
     start() {
         if (!navigator.userAgent.includes("Windows")) return;
         controller = new AbortController();
@@ -117,6 +161,8 @@ export default definePlugin({
         controller.abort();
         controller = undefined;
         current = undefined;
+        mutedByPlugin = false;
+        deafenedByPlugin = false;
         clearTimeout(timer);
         navigator.mediaDevices?.removeEventListener("devicechange", onDeviceChange);
         void native()?.stopReader().catch(error => console.warn("[WindowsAudioSync]", error));

@@ -22,9 +22,26 @@ interface IDeviceEnumerator {
 
 [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IDevice {
-    void Activate(ref Guid iid, int context, IntPtr parameters, out IntPtr result);
+    void Activate(ref Guid iid, int context, IntPtr parameters, [MarshalAs(UnmanagedType.IUnknown)] out object result);
     void OpenPropertyStore(int mode, out IProperties store);
     void GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+}
+
+[ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IEndpointVolume {
+    void RegisterControlChangeNotify(IntPtr callback);
+    void UnregisterControlChangeNotify(IntPtr callback);
+    void GetChannelCount(out uint count);
+    void SetMasterVolumeLevel(float level, IntPtr context);
+    void SetMasterVolumeLevelScalar(float level, IntPtr context);
+    void GetMasterVolumeLevel(out float level);
+    void GetMasterVolumeLevelScalar(out float level);
+    void SetChannelVolumeLevel(uint channel, float level, IntPtr context);
+    void SetChannelVolumeLevelScalar(uint channel, float level, IntPtr context);
+    void GetChannelVolumeLevel(uint channel, out float level);
+    void GetChannelVolumeLevelScalar(uint channel, out float level);
+    void SetMute([MarshalAs(UnmanagedType.Bool)] bool muted, IntPtr context);
+    void GetMute([MarshalAs(UnmanagedType.Bool)] out bool muted);
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -76,10 +93,28 @@ public static class WindowsAudioReader {
         return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value ?? ""));
     }
 
+    static string Silence(IDevice device, int flow) {
+        object volume;
+        var iid = typeof(IEndpointVolume).GUID;
+        try {
+            device.Activate(ref iid, 23, IntPtr.Zero, out volume);
+            try {
+                var endpoint = (IEndpointVolume)volume;
+                bool muted;
+                endpoint.GetMute(out muted);
+                float level = 1;
+                if (flow == 0) endpoint.GetMasterVolumeLevelScalar(out level);
+                return muted || level <= 0 ? "1" : "0";
+            } finally { Marshal.ReleaseComObject(volume); }
+        } catch (COMException) {
+            return "";
+        }
+    }
+
     static string Read(IDeviceEnumerator enumerator, int flow) {
         IDevice device;
         int result = enumerator.GetDefaultAudioEndpoint(flow, 1, out device);
-        if (result == unchecked((int)0x80070490)) return "|";
+        if (result == unchecked((int)0x80070490)) return "||";
         Marshal.ThrowExceptionForHR(result);
         try {
             string id;
@@ -92,7 +127,7 @@ public static class WindowsAudioReader {
                 store.GetValue(ref key, out value);
                 try {
                     string name = value.Type == 31 ? Marshal.PtrToStringUni(value.Pointer) : "";
-                    return Encode(id) + "|" + Encode(name);
+                    return Encode(id) + "|" + Encode(name) + "|" + Silence(device, flow);
                 } finally { PropVariantClear(ref value); }
             } finally { Marshal.ReleaseComObject(store); }
         } finally { Marshal.ReleaseComObject(device); }
@@ -115,10 +150,16 @@ public static class WindowsAudioReader {
                 parentMonitor.IsBackground = true;
                 parentMonitor.Start();
             }
+            string previous = null;
             do {
-                Console.WriteLine("AUDIO|" + Read(enumerator, 1) + "|" + Read(enumerator, 0));
-                Console.Out.Flush();
-            } while (!once && callback.Changed.WaitOne());
+                string next = "AUDIO|" + Read(enumerator, 1) + "|" + Read(enumerator, 0);
+                if (next != previous) {
+                    Console.WriteLine(next);
+                    Console.Out.Flush();
+                    previous = next;
+                }
+                if (!once) callback.Changed.WaitOne(500);
+            } while (!once);
         } finally {
             if (registered) enumerator.UnregisterEndpointNotificationCallback(callback);
             callback.Changed.Dispose();
@@ -164,13 +205,16 @@ function start() {
     const lines = createInterface({ input: proc.stdout });
     lines.on("line", line => {
         if (child !== proc || !line.startsWith("AUDIO|")) return;
-        const fields = line.split("|").slice(1).map(field => Buffer.from(field, "base64").toString("utf8"));
-        if (fields.length !== 4) return;
-        const [inputId, inputName, outputId, outputName] = fields;
+        const fields = line.split("|").slice(1);
+        if (fields.length !== 6) return;
+        const [inputId, inputName, inputSilent, outputId, outputName, outputSilent] = fields;
+        const decode = (value: string) => Buffer.from(value, "base64").toString("utf8");
+        const endpoint = (id: string, name: string, silent: string) =>
+            id ? { id: decode(id), name: decode(name), silent: silent === "" ? null : silent === "1" } : null;
         snapshot = {
             revision: ++revision,
-            input: inputId ? { id: inputId, name: inputName } : null,
-            output: outputId ? { id: outputId, name: outputName } : null
+            input: endpoint(inputId, inputName, inputSilent),
+            output: endpoint(outputId, outputName, outputSilent)
         };
         wake?.();
     });

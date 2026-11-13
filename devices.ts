@@ -1,6 +1,7 @@
 export interface Endpoint {
     id: string;
     name: string;
+    silent: boolean | null;
 }
 
 export interface Snapshot {
