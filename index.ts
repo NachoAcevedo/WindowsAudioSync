@@ -20,26 +20,30 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Follow the Windows default microphone and its mute state",
         default: true,
-        onChange: onDeviceChange
+        onChange: onSettingsChange
     },
     syncOutput: {
         type: OptionType.BOOLEAN,
         description: "Follow the Windows default output and deafen when it is muted or at zero volume",
         default: true,
-        onChange: onDeviceChange
+        onChange: onSettingsChange
     }
 });
 
 let controller: AbortController | undefined;
 let current: Snapshot | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
+let silenceTimer: ReturnType<typeof setTimeout> | undefined;
 let retries = 0;
 let mutedByPlugin = false;
 let deafenedByPlugin = false;
 let applyingSilence = false;
 
 async function syncSilence(run: AbortController, snapshot: Snapshot) {
-    if (applyingSilence) return;
+    if (applyingSilence) {
+        scheduleSilence(10);
+        return;
+    }
     applyingSilence = true;
     const store = MediaEngineStore;
     const mute = settings.store.syncInput ? snapshot.input?.silent : false;
@@ -66,8 +70,22 @@ async function syncSilence(run: AbortController, snapshot: Snapshot) {
         }
     } finally {
         applyingSilence = false;
-        if (controller && (controller !== run || current !== snapshot)) schedule(0);
+        if (controller === run && current !== snapshot) scheduleSilence();
     }
+}
+
+function scheduleSilence(delay = 0) {
+    clearTimeout(silenceTimer);
+    const run = controller;
+    if (!run || !current) return;
+    // A timer keeps Discord's Flux dispatch outside store and settings callbacks.
+    silenceTimer = setTimeout(() => {
+        const snapshot = current;
+        if (!snapshot || run.signal.aborted) return;
+        void syncSilence(run, snapshot).catch(error => {
+            console.warn("[WindowsAudioSync] Failed to synchronize mute and deafen", error);
+        });
+    }, delay);
 }
 
 function schedule(delay: number) {
@@ -83,9 +101,9 @@ async function apply() {
         const store = MediaEngineStore;
         if (store) {
             const web = await navigator.mediaDevices?.enumerateDevices().catch(() => []) ?? [];
-            if (run.signal.aborted || current !== snapshot) return;
-            await syncSilence(run, snapshot);
-            if (run.signal.aborted || current !== snapshot) return;
+            if (run.signal.aborted || !current) return;
+            if (current.input?.id !== snapshot.input?.id || current.input?.name !== snapshot.input?.name ||
+                current.output?.id !== snapshot.output?.id || current.output?.name !== snapshot.output?.name) return;
             let retry = false;
             if (settings.store.syncInput && snapshot.input) {
                 const input = matchDevice(snapshot.input, Object.values(store.getInputDevices()),
@@ -102,7 +120,7 @@ async function apply() {
             if (!retry) return;
         }
     } catch (error) {
-        console.warn("[WindowsAudioSync] Failed to synchronize Discord audio", error);
+        console.warn("[WindowsAudioSync] Failed to select a Discord device", error);
     }
     if (retries++ < 4) schedule(750);
 }
@@ -110,6 +128,11 @@ async function apply() {
 function onDeviceChange() {
     retries = 0;
     schedule(250);
+}
+
+function onSettingsChange() {
+    scheduleSilence();
+    onDeviceChange();
 }
 
 async function watch(run: AbortController) {
@@ -125,9 +148,13 @@ async function watch(run: AbortController) {
             const snapshot = await api.nextDefaults(revision);
             if (run.signal.aborted) return;
             if (snapshot) {
+                const devicesChanged = !current ||
+                    snapshot.input?.id !== current.input?.id || snapshot.input?.name !== current.input?.name ||
+                    snapshot.output?.id !== current.output?.id || snapshot.output?.name !== current.output?.name;
                 current = snapshot;
                 revision = snapshot.revision;
-                onDeviceChange();
+                scheduleSilence();
+                if (devicesChanged) onDeviceChange();
             }
         } catch (error) {
             if (run.signal.aborted) return;
@@ -164,6 +191,7 @@ export default definePlugin({
         mutedByPlugin = false;
         deafenedByPlugin = false;
         clearTimeout(timer);
+        clearTimeout(silenceTimer);
         navigator.mediaDevices?.removeEventListener("devicechange", onDeviceChange);
         void native()?.stopReader().catch(error => console.warn("[WindowsAudioSync]", error));
     }

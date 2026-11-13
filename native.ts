@@ -27,10 +27,22 @@ interface IDevice {
     void GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
 }
 
+[ComVisible(true), Guid("657804FA-D6AD-4496-8A60-352752AF4F89"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IVolumeNotifications {
+    [PreserveSig] int OnNotify(IntPtr notification);
+}
+
+[ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+public sealed class VolumeNotifications : IVolumeNotifications {
+    readonly AutoResetEvent changed;
+    public VolumeNotifications(AutoResetEvent changed) { this.changed = changed; }
+    public int OnNotify(IntPtr notification) { changed.Set(); return 0; }
+}
+
 [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 interface IEndpointVolume {
-    void RegisterControlChangeNotify(IntPtr callback);
-    void UnregisterControlChangeNotify(IntPtr callback);
+    void RegisterControlChangeNotify(IVolumeNotifications callback);
+    void UnregisterControlChangeNotify(IVolumeNotifications callback);
     void GetChannelCount(out uint count);
     void SetMasterVolumeLevel(float level, IntPtr context);
     void SetMasterVolumeLevelScalar(float level, IntPtr context);
@@ -93,28 +105,63 @@ public static class WindowsAudioReader {
         return Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value ?? ""));
     }
 
-    static string Silence(IDevice device, int flow) {
-        object volume;
-        var iid = typeof(IEndpointVolume).GUID;
-        try {
-            device.Activate(ref iid, 23, IntPtr.Zero, out volume);
+    sealed class Endpoint : IDisposable {
+        string id;
+        IEndpointVolume volume;
+        readonly VolumeNotifications callback;
+        public bool NeedsPolling { get; private set; }
+
+        public Endpoint(AutoResetEvent changed) {
+            callback = new VolumeNotifications(changed);
+        }
+
+        public string Silence(IDevice device, string nextId, int flow) {
+            if (nextId != id) Dispose();
+            id = nextId;
             try {
-                var endpoint = (IEndpointVolume)volume;
+                if (volume == null) {
+                    object instance;
+                    var iid = typeof(IEndpointVolume).GUID;
+                    device.Activate(ref iid, 23, IntPtr.Zero, out instance);
+                    volume = (IEndpointVolume)instance;
+                    NeedsPolling = true;
+                    try {
+                        volume.RegisterControlChangeNotify(callback);
+                        NeedsPolling = false;
+                    } catch (COMException) { }
+                }
                 bool muted;
-                endpoint.GetMute(out muted);
+                volume.GetMute(out muted);
                 float level = 1;
-                if (flow == 0) endpoint.GetMasterVolumeLevelScalar(out level);
+                if (flow == 0) volume.GetMasterVolumeLevelScalar(out level);
                 return muted || level <= 0 ? "1" : "0";
-            } finally { Marshal.ReleaseComObject(volume); }
-        } catch (COMException) {
-            return "";
+            } catch (COMException) {
+                Dispose();
+                NeedsPolling = true;
+                return "";
+            }
+        }
+
+        public void Dispose() {
+            if (volume != null) {
+                try {
+                    if (!NeedsPolling) volume.UnregisterControlChangeNotify(callback);
+                } catch (COMException) { }
+                finally { Marshal.ReleaseComObject(volume); }
+            }
+            volume = null;
+            id = null;
+            NeedsPolling = false;
         }
     }
 
-    static string Read(IDeviceEnumerator enumerator, int flow) {
+    static string Read(IDeviceEnumerator enumerator, Endpoint endpoint, int flow) {
         IDevice device;
         int result = enumerator.GetDefaultAudioEndpoint(flow, 1, out device);
-        if (result == unchecked((int)0x80070490)) return "||";
+        if (result == unchecked((int)0x80070490)) {
+            endpoint.Dispose();
+            return "||";
+        }
         Marshal.ThrowExceptionForHR(result);
         try {
             string id;
@@ -127,7 +174,7 @@ public static class WindowsAudioReader {
                 store.GetValue(ref key, out value);
                 try {
                     string name = value.Type == 31 ? Marshal.PtrToStringUni(value.Pointer) : "";
-                    return Encode(id) + "|" + Encode(name) + "|" + Silence(device, flow);
+                    return Encode(id) + "|" + Encode(name) + "|" + endpoint.Silence(device, id, flow);
                 } finally { PropVariantClear(ref value); }
             } finally { Marshal.ReleaseComObject(store); }
         } finally { Marshal.ReleaseComObject(device); }
@@ -137,6 +184,8 @@ public static class WindowsAudioReader {
         var enumerator = (IDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(
             new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")));
         var callback = new AudioNotifications();
+        var input = new Endpoint(callback.Changed);
+        var output = new Endpoint(callback.Changed);
         bool registered = false;
         try {
             if (!once) {
@@ -152,17 +201,18 @@ public static class WindowsAudioReader {
             }
             string previous = null;
             do {
-                string next = "AUDIO|" + Read(enumerator, 1) + "|" + Read(enumerator, 0);
+                string next = "AUDIO|" + Read(enumerator, input, 1) + "|" + Read(enumerator, output, 0);
                 if (next != previous) {
                     Console.WriteLine(next);
                     Console.Out.Flush();
                     previous = next;
                 }
-                if (!once) callback.Changed.WaitOne(500);
+                if (!once) callback.Changed.WaitOne(input.NeedsPolling || output.NeedsPolling ? 500 : Timeout.Infinite);
             } while (!once);
         } finally {
+            input.Dispose();
+            output.Dispose();
             if (registered) enumerator.UnregisterEndpointNotificationCallback(callback);
-            callback.Changed.Dispose();
             Marshal.ReleaseComObject(enumerator);
         }
     }
